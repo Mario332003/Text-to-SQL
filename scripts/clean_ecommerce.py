@@ -43,12 +43,20 @@ def yes_no_to_bool(series: pd.Series) -> pd.Series:
         "false": False,
         "0": False,
     }
-    return series.astype(str).str.strip().str.lower().map(mapping)
+    # Preserve missing values: astype(str) turns pd.NA/None/NaN into
+    # "<NA>"/"None"/"nan", which would miss the map and become float NaN.
+    result = pd.Series(pd.NA, index=series.index, dtype="boolean")
+    mask = series.notna()
+    if mask.any():
+        normalized = series.loc[mask].astype(str).str.strip().str.lower()
+        result.loc[mask] = normalized.map(mapping)
+    return result
 
 
 def profile(df: pd.DataFrame) -> str:
+    n_rows = len(df)
     lines = [
-        f"rows={len(df):,}",
+        f"rows={n_rows:,}",
         f"cols={df.shape[1]}",
         f"duplicate_rows={df.duplicated().sum():,}",
         "",
@@ -57,7 +65,8 @@ def profile(df: pd.DataFrame) -> str:
     nulls = df.isna().sum().sort_values(ascending=False)
     for col, n in nulls.items():
         if n > 0:
-            lines.append(f"{col}: {n:,} ({n / len(df):.1%})")
+            pct = (n / n_rows) if n_rows else 0.0
+            lines.append(f"{col}: {n:,} ({pct:.1%})")
     lines.append("")
     lines.append("--- dtypes ---")
     for col, dtype in df.dtypes.items():
