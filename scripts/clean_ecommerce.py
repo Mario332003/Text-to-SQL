@@ -31,6 +31,15 @@ DATE_COLS = ["order_date", "account_creation_date"]
 # Columns often empty for good reason (e.g. no return) — keep as nullable text
 NULLABLE_TEXT = ["return_reason", "customer_feedback", "coupon_code"]
 
+# Explicit labels for NULLABLE_TEXT columns, so "missing" is a real value
+# instead of a blank cell. This keeps counts consistent across pandas,
+# SQL, and Excel (COUNT/COUNTIF/COUNTA all treat blanks differently).
+NULLABLE_TEXT_FILL = {
+    "return_reason": "Nothing",
+    "coupon_code": "No Coupon",
+    "customer_feedback": "No Feedback",
+}
+
 
 def yes_no_to_bool(series: pd.Series) -> pd.Series:
     mapping = {
@@ -119,6 +128,13 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     ]:
         if col in df.columns:
             df.loc[df[col] < 0, col] = pd.NA
+
+    # Fill nullable text columns with explicit "not applicable" labels
+    # instead of leaving them blank/NaN. Do this last so it only replaces
+    # genuine "not applicable" gaps, not ones caused by earlier parsing.
+    for col, fill_val in NULLABLE_TEXT_FILL.items():
+        if col in df.columns:
+            df[col] = df[col].fillna(fill_val)
 
     # Optional: drop derived date parts if you keep order_date (reduces redundancy for SQL)
     # Uncomment if you want a leaner table:
