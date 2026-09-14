@@ -217,6 +217,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Local datasets (too large for git)
+# Local datasets (too large for git / keep out of repo)
 archive/
-data/
+data/*
+!data/cleaned/
+data/cleaned/*
+!data/cleaned/ecommerce_cleaned.csv
