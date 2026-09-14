@@ -77,10 +77,15 @@ def profile(df: pd.DataFrame) -> str:
 def clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Strip whitespace on object columns
+    # Strip whitespace on object columns (preserve missing values)
     for col in df.select_dtypes(include="object").columns:
-        df[col] = df[col].astype(str).str.strip()
-        df[col] = df[col].replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA})
+        mask = df[col].notna()
+        stripped = df.loc[mask, col].astype(str).str.strip()
+        stripped = stripped.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA, "<NA>": pd.NA})
+        df[col] = df[col].astype("object")
+        df.loc[mask, col] = stripped
+        # Ensure original nulls stay null (not the string "<NA>")
+        df.loc[~mask, col] = pd.NA
 
     # Parse dates
     for col in DATE_COLS:
@@ -138,13 +143,12 @@ def main() -> None:
         profile(cleaned), encoding="utf-8"
     )
 
-    # Prefer Parquet for speed + typed columns; CSV for easy peeking
+    # Prefer Parquet for speed + typed columns; also write CSV for easy peeking
     cleaned.to_parquet(OUT_PARQUET, index=False)
     print(f"Saved {OUT_PARQUET}")
 
-    # Uncomment if you also need CSV (much larger):
-    # cleaned.to_csv(OUT_CSV, index=False)
-    # print(f"Saved {OUT_CSV}")
+    cleaned.to_csv(OUT_CSV, index=False)
+    print(f"Saved {OUT_CSV}")
 
     print("Done.")
 
