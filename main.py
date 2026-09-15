@@ -10,14 +10,13 @@ import ollama
 # CONFIGURATION
 # =========================================================
 
-CSV_PATH = "/Users/mario/Text-to-SQL/data/ecommerce_cleaned.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DB_PATH = "/Users/mario/Text-to-SQL/data/ecommerce.db"
+CSV_PATH = os.path.join(BASE_DIR, "data", "ecommerce_cleaned.csv")
+DB_PATH = os.path.join(BASE_DIR, "data", "ecommerce.db")
 
 TABLE_NAME = "ecommerce"
-
 MODEL_NAME = "qwen3:8b-q4_K_M"
-
 
 # =========================================================
 # DATABASE SCHEMA
