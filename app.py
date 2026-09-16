@@ -1,160 +1,68 @@
 import streamlit as st
 
-from main import (
-    create_database,
-    generate_sql,
-    validate_sql,
-    execute_sql
-)
+from main import create_database, generate_sql, validate_sql, execute_sql, generate_answer
 
+# Run with: python -m streamlit run app.py
+st.set_page_config(page_title="Local Text-to-SQL", page_icon="🤖", layout="wide")
 
-# ---------------------------------------------------------
-# PAGE CONFIGURATION
-# ---------------------------------------------------------
-
-st.set_page_config(
-    page_title="Local Text-to-SQL",
-    page_icon="🤖",
-    layout="wide"
-)
-
-
-# ---------------------------------------------------------
-# INITIALIZE DATABASE
-# ---------------------------------------------------------
 
 @st.cache_resource
 def initialize_database():
     create_database()
 
 
-initialize_database()
-
-
-# ---------------------------------------------------------
-# HEADER
-# ---------------------------------------------------------
-
 st.title("🤖 Local Text-to-SQL")
+st.write("Ask questions about the e-commerce dataset and get answers in plain English.")
 
-st.write(
-    "Ask a question about the e-commerce dataset "
-    "and the AI will convert it into SQL."
-)
+try:
+    initialize_database()
+except Exception as error:
+    st.error(f"Could not initialize the database: {error}")
+    st.stop()
 
-st.divider()
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-
-# ---------------------------------------------------------
-# USER INPUT
-# ---------------------------------------------------------
-
-question = st.text_area(
-    "Ask a question",
-    placeholder="Example: How many customers are older than 40?",
-    height=100
-)
+if st.sidebar.button("Clear conversation"):
+    st.session_state.messages = []
 
 
-# ---------------------------------------------------------
-# GENERATE BUTTON
-# ---------------------------------------------------------
+def display_message(message):
+    with st.chat_message(message["role"]):
+        if message.get("error"):
+            st.error(message["content"])
+        else:
+            st.markdown(message["content"])
+        if message.get("sql"):
+            with st.expander("Query details"):
+                st.code(message["sql"], language="sql")
+                if "result" in message:
+                    st.dataframe(message["result"], use_container_width=True)
 
-if st.button(
-    "Generate SQL",
-    type="primary",
-    use_container_width=True
-):
 
-    # Check that the user entered something
-    if not question.strip():
+for message in st.session_state.messages:
+    display_message(message)
 
-        st.warning(
-            "Please enter a question."
-        )
-
-    else:
-
+if prompt := st.chat_input("Example: How many customers are older than 40?"):
+    question = prompt.strip()
+    if question:
+        history = list(st.session_state.messages)
+        user_message = {"role": "user", "content": question}
+        st.session_state.messages.append(user_message)
+        display_message(user_message)
+        assistant_message = {"role": "assistant"}
         try:
-
-            # ---------------------------------------------
-            # STEP 1: GENERATE SQL
-            # ---------------------------------------------
-
-            with st.spinner(
-                "Generating SQL using Qwen..."
-            ):
-
-                sql = generate_sql(
-                    question
-                )
-
-
-            # ---------------------------------------------
-            # STEP 2: DISPLAY GENERATED SQL
-            # ---------------------------------------------
-
-            st.subheader(
-                "Generated SQL"
-            )
-
-            st.code(
-                sql,
-                language="sql"
-            )
-
-
-            # ---------------------------------------------
-            # STEP 3: VALIDATE SQL
-            # ---------------------------------------------
-
-            if not validate_sql(sql):
-
-                st.error(
-                    "The generated SQL was rejected "
-                    "by the safety validator."
-                )
-
-                st.stop()
-
-
-            # ---------------------------------------------
-            # STEP 4: EXECUTE SQL
-            # ---------------------------------------------
-
-            with st.spinner(
-                "Executing query..."
-            ):
-
-                result = execute_sql(
-                    sql
-                )
-
-
-            # ---------------------------------------------
-            # STEP 5: DISPLAY RESULT
-            # ---------------------------------------------
-
-            st.subheader(
-                "Result"
-            )
-
-            if result.empty:
-
-                st.info(
-                    "No results found."
-                )
-
-            else:
-
-                st.dataframe(
-                    result,
-                    use_container_width=True
-                )
-
-
+            with st.spinner("Checking the data with Qwen..."):
+                sql = generate_sql(question, history=history)
+                assistant_message["sql"] = sql
+                if not validate_sql(sql):
+                    raise ValueError("The generated SQL was rejected by the safety validator.")
+                result = execute_sql(sql)
+                assistant_message["result"] = result
+                assistant_message["content"] = generate_answer(question, sql, result)
         except Exception as error:
-
-            st.error(
-                f"Error: {error}"
+            assistant_message.update(
+                content=f"I couldn't answer this question: {error}", error=True
             )
+        st.session_state.messages.append(assistant_message)
+        display_message(assistant_message)
