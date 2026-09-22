@@ -3,10 +3,5 @@ numpy>=1.24.0
 pyarrow>=14.0.0
 openpyxl>=3.1.0
 jupyter>=1.0.0
-<<<<<<< HEAD
-=======
-
 streamlit
-pandas
 ollama
->>>>>>> f6fe3a1931518d9fb9b8dace7578502fbb1aab11
