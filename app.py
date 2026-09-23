@@ -1,4 +1,6 @@
+import os
 import re
+
 
 import streamlit as st
 
@@ -38,16 +40,30 @@ st.sidebar.caption(
     "Change the path or replace the file, then rerun the app."
 )
 
-st.sidebar.button("Reload dataset")
+reload_clicked = st.sidebar.button("Reload dataset")
 
 
 # ============================================================
-# CREATE / LOAD DATABASE
+# CREATE / LOAD DATABASE (cached across reruns/questions)
 # ============================================================
+
+@st.cache_resource(show_spinner=False)
+def get_dataset(path: str, file_mtime: float):
+    return create_database(path)
+
+
+try:
+    file_mtime = os.path.getmtime(csv_path)
+except OSError as error:
+    st.error(f"Could not find the CSV file: {error}")
+    st.stop()
+
+if reload_clicked:
+    get_dataset.clear()
 
 try:
     with st.spinner("Preparing dataset and schema with Qwen..."):
-        dataset = create_database(csv_path)
+        dataset = get_dataset(csv_path, file_mtime)
 
 except Exception as error:
     st.error(f"Could not initialize the dataset: {error}")
@@ -106,10 +122,58 @@ def escape_markdown_math(text):
 
 
 # ============================================================
+# CHART RENDERING
+# ============================================================
+# Each chart dict now carries: title, data (DataFrame with label/value
+# columns), chart_type (the suggested default: 'bar' | 'pie' | 'line'), and
+# available_types (what else the user could switch to). This renders the
+# default type and offers a selector to switch, per chart, without re-running
+# any SQL or LLM calls - it's the same underlying data either way.
+
+_CHART_LABELS = {"bar": "Bar", "pie": "Pie", "line": "Line"}
+
+
+def render_chart(chart, key_prefix):
+    st.subheader(chart["title"])
+
+    available = chart.get("available_types", [chart.get("chart_type", "bar")])
+    default_type = chart.get("chart_type", available[0])
+
+    if len(available) > 1:
+        choice = st.radio(
+            "Chart type",
+            options=available,
+            format_func=lambda t: _CHART_LABELS.get(t, t.title()),
+            index=available.index(default_type) if default_type in available else 0,
+            horizontal=True,
+            key=f"{key_prefix}_{chart['title']}",
+        )
+    else:
+        choice = default_type
+
+    data = chart["data"]
+
+    if choice == "pie":
+        # st.bar_chart/st.line_chart have no native pie option; use a small
+        # Plotly figure only for this case, matplotlib-free and dependency-light.
+        try:
+            import plotly.express as px
+            fig = px.pie(data, names="label", values="value", title=None)
+            st.plotly_chart(fig, use_container_width=True)
+        except ImportError:
+            st.warning("Pie charts require the `plotly` package; showing a bar chart instead.")
+            st.bar_chart(data, x="label", y="value")
+    elif choice == "line":
+        st.line_chart(data, x="label", y="value")
+    else:
+        st.bar_chart(data, x="label", y="value")
+
+
+# ============================================================
 # DISPLAY A CHAT MESSAGE
 # ============================================================
 
-def display_message(message):
+def display_message(message, msg_index=0):
     with st.chat_message(message["role"]):
 
         if message.get("error"):
@@ -117,10 +181,11 @@ def display_message(message):
         else:
             st.markdown(escape_markdown_math(message["content"]))
 
-        # Charts built from computed SQL results
-        for chart in message.get("charts", []):
-            st.subheader(chart["title"])
-            st.bar_chart(chart["data"], x="label", y="value")
+        # Charts: either explicitly requested ("show me a chart of...") or
+        # attached automatically as the default visualization for any
+        # analysis answer. Same rendering path either way.
+        for i, chart in enumerate(message.get("charts", [])):
+            render_chart(chart, key_prefix=f"msg{msg_index}_chart{i}")
 
         # SQL / debug details (single-query path)
         if message.get("sql"):
@@ -140,8 +205,8 @@ def display_message(message):
 # DISPLAY PREVIOUS CONVERSATION
 # ============================================================
 
-for message in st.session_state.messages:
-    display_message(message)
+for i, message in enumerate(st.session_state.messages):
+    display_message(message, msg_index=i)
 
 
 # ============================================================
@@ -153,7 +218,8 @@ def answer_question(standalone):
     message = {"role": "assistant"}
 
     try:
-        # 1. Chart / visual requests: Python draws them, no LLM involved
+        # 1. Explicit chart-only requests ("show me a chart of...") with no
+        # narration wanted: Python draws them directly, no LLM narration call.
         if wants_charts(standalone):
             with st.spinner("Building charts..."):
                 charts, label = build_charts(standalone, dataset)
@@ -164,10 +230,15 @@ def answer_question(standalone):
                 "I couldn't build charts for that scope. Check that it matches data in the file."
             )
 
-        # 2. Broad analysis: several queries, or the year-scoped analysis
+        # 2. Broad analysis: several queries, or the year-scoped analysis.
+        # multi_query_analysis now always returns both the narrated text AND
+        # a default set of the most relevant charts in one call, so no
+        # separate build_charts() call is needed on this path.
         elif classify_question(standalone):
             with st.spinner("Planning and running multiple SQL queries..."):
-                message["content"] = multi_query_analysis(standalone, dataset)
+                result = multi_query_analysis(standalone, dataset)
+            message["content"] = result["text"]
+            message["charts"] = result["charts"]
 
         # 3. Specific lookup: one SQL query
         else:
@@ -184,9 +255,9 @@ def answer_question(standalone):
                         "The generated SQL was rejected by the safety validator."
                     )
 
-                result = execute_sql(sql, db_path=dataset["db_path"])
-                message["result"] = result
-                message["content"] = generate_answer(standalone, sql, result)
+                result_df = execute_sql(sql, db_path=dataset["db_path"])
+                message["result"] = result_df
+                message["content"] = generate_answer(standalone, sql, result_df)
 
     except Exception as error:
         message.update(
@@ -223,9 +294,9 @@ if prompt := st.chat_input("Ask a question about this dataset"):
             user_message["content"] = f"{question} (interpreted as: {standalone})"
 
         st.session_state.messages.append(user_message)
-        display_message(user_message)
+        display_message(user_message, msg_index=len(st.session_state.messages) - 1)
 
         assistant_message = answer_question(standalone)
 
         st.session_state.messages.append(assistant_message)
-        display_message(assistant_message)
+        display_message(assistant_message, msg_index=len(st.session_state.messages) - 1)
