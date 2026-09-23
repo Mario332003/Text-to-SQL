@@ -274,12 +274,24 @@ def find_unknown_columns(sql, schema_dict):
     quoted = {q.replace('""', '"') for q in re.findall(r'"((?:[^"]|"")*)"', sql)}
     return sorted(quoted - known)
 
+_DISTINCT_SAMPLES_CACHE = {}
+
 
 def get_distinct_column_samples(db_path, schema, max_values=12):
     """Read a small set of real categorical values from SQLite for grounding.
     The LLM still decides the schema and SQL; these values simply prevent it
     from inventing category/status values that do not exist in the data (e.g.
-    writing 'Returned' when the real value is 'Yes')."""
+    writing 'Returned' when the real value is 'Yes').
+
+    Cached per db_path: each dataset version has its own immutable .db file
+    (see create_database's fingerprint-based folder naming), so the distinct
+    values never change for a given db_path and recomputing them on every
+    single question - a full-ish table scan per TEXT column - was pure
+    wasted work."""
+    cache_key = str(db_path)
+    if cache_key in _DISTINCT_SAMPLES_CACHE:
+        return _DISTINCT_SAMPLES_CACHE[cache_key]
+
     samples = {}
     columns = schema.get("columns", [])
     with sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True) as connection:
@@ -297,8 +309,9 @@ def get_distinct_column_samples(db_path, schema, max_values=12):
                 samples[name] = [row[0] for row in rows]
             except sqlite3.Error:
                 continue
-    return samples
 
+    _DISTINCT_SAMPLES_CACHE[cache_key] = samples
+    return samples
 
 # =========================================================
 # GENERATE SQL USING QWEN
@@ -462,7 +475,7 @@ def resolve_follow_up(question, history=None):
     except Exception:
         pass
     return question  # on any failure, fail safe: no inherited context
-   
+
 def question_needs_history(question, history=None):
     # History is now handled by resolve_follow_up(), which rewrites follow-ups
     # into standalone questions. Downstream functions should never see raw history.
@@ -487,6 +500,31 @@ def conversation_context(history=None, max_turns=4):
             **({"sql": message["sql"]} if message.get("sql") else {}),
         })
     return json.dumps(turns, ensure_ascii=False)
+
+
+_VISUAL_OFFER_PATTERN = re.compile(
+    r"(?im)^.*\b(would you like|want me to|shall i|i can (also |help you )?(create|generate|make|build|show)"
+    r"|here'?s a visual|check out the (chart|graph|visual))\b.*\b(chart|graph|visual|dashboard|plot)\b.*$"
+)
+_EMOJI_PATTERN = re.compile(
+    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F000-\U0001F0FF]+"
+)
+
+
+def clean_narration_text(text):
+    """Safety net applied to every LLM-narrated answer. The system prompts
+    already say 'no emoji, no offers of charts', but a local 8B model
+    sometimes adds a closing line like 'Would you like a visual summary? 📊📊'
+    anyway. Strip such lines and any stray emoji so the visible answer stays
+    plain, clean prose regardless of whether the model followed instructions."""
+    if not text:
+        return text
+    lines = [ln for ln in text.splitlines() if not _VISUAL_OFFER_PATTERN.match(ln.strip())]
+    cleaned = "\n".join(lines)
+    cleaned = _EMOJI_PATTERN.sub("", cleaned)
+    # Collapse any blank-line buildup left behind by removed lines/emoji.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
 
 
 def result_fallback(result):
@@ -753,7 +791,7 @@ def analyze_dataset(question, dataset):
             stream=False,
             options={"temperature": 0},
         )
-        answer = response.message.content.strip()
+        answer = clean_narration_text(response.message.content.strip())
         return answer if answer else summary
     except Exception:
         # Fall back to the raw computed summary if the model call fails.
@@ -822,8 +860,16 @@ def analyze_scope(question, dataset):
                 {"role": "system", "content": (
                     "Write a short plain-English analysis (3 to 5 short paragraphs) of the "
                     "facts below. State the scope in the first sentence. Use only numbers "
-                    "copied exactly from the facts. No tables, no emoji, no offers of charts. "
-                    "Mention the biggest categories, the status split, and anything unusual."
+                    "copied exactly from the facts. Mention the biggest categories, the "
+                    "status split, and anything unusual.\n"
+                    "STRICT FORMAT RULES (the response is rejected and reprocessed if broken):\n"
+                    "- No Markdown tables.\n"
+                    "- No emoji, anywhere, under any circumstance.\n"
+                    "- Never end with, or include anywhere, a question or offer about making "
+                    "charts, graphs, visuals, or dashboards (e.g. do not write anything like "
+                    "'Would you like a visual summary?'). Visualizations are handled by a "
+                    "separate system automatically; do not mention them at all.\n"
+                    "- End the analysis on a substantive sentence, not a question to the user."
                 )},
                 {"role": "user", "content": f"Request: {question}\n\nFACTS:\n{facts}"},
             ],
@@ -832,7 +878,23 @@ def analyze_scope(question, dataset):
         narration = response.message.content.strip()
     except Exception as error:
         narration = f"(Narration unavailable: {error})"
-    return f"{narration}\n\n===== COMPUTED FIGURES =====\n{facts}"
+    # The raw facts dump used to be appended here, which made every scoped
+    # analysis answer end in a huge wall of numbers. Charts (built separately
+    # in multi_query_analysis) now carry that numeric detail visually, so the
+    # user-facing text stays just the clean narration. Facts are still fully
+    # computed above and can be logged/inspected if needed for debugging.
+    return clean_narration_text(narration)
+
+
+# =========================================================
+# DEFAULT VISUALIZATION (now attached to every analysis)
+# =========================================================
+# Chart building is no longer gated behind keywords like "chart" or "graph".
+# Every analysis path (multi_query_analysis, analyze_scope, analyze_dataset)
+# now also returns a small set of the MOST RELEVANT charts alongside the
+# narrated text, so a caller (CLI, Streamlit, etc.) can render a default
+# visualization without the user having to ask for one explicitly.
+
 CHART_KEYWORDS = ("chart", "graph", "plot", "visual", "dashboard")
 
 # (title, group column, measure column or None for order counts)
@@ -847,21 +909,71 @@ CHART_SPECS = [
     ("Top countries by orders", "country", None),
 ]
 
+# How many of the applicable charts to keep by default. Kept small so the
+# caller shows only the most relevant visualizations, not every possible one.
+MAX_DEFAULT_CHARTS = 3
+
 
 def wants_charts(question):
     q = question.lower()
     return any(k in q for k in CHART_KEYWORDS)
 
 
-def build_charts(question, dataset):
+def suggest_chart_types(group_column):
+    """Which chart types make sense for a given grouping column. Time-like
+    columns suggest a line chart first; everything else suggests bar/pie."""
+    name = group_column.lower()
+    if "month" in name or "date" in name or "year" in name or "day" in name:
+        return ["line", "bar"]
+    return ["bar", "pie"]
+
+
+def _chart_relevance_score(title, group, measure, question, names):
+    """Rank a candidate chart by how relevant it is to the actual question,
+    so build_charts can keep only the most relevant few instead of everything
+    that is merely applicable to the schema."""
+    q = question.lower()
+    score = 0
+    # A grouping column the user explicitly named is the strongest signal.
+    if group.replace("_", " ") in q or group in q:
+        score += 5
+    # A measure the user explicitly named is next strongest.
+    if measure and (measure.replace("_", " ") in q or measure.replace("_usd", "") in q):
+        score += 4
+    # Generic analysis requests favor revenue/profit and status/category
+    # breakdowns over more niche ones, since those are usually most informative.
+    if measure in ("total_price_usd", "profit_usd"):
+        score += 2
+    if group in ("category", "order_status", "order_month"):
+        score += 1
+    return score
+
+
+def build_charts(question, dataset, max_charts=MAX_DEFAULT_CHARTS):
+    """Return only the most relevant charts for this question (default cap:
+    MAX_DEFAULT_CHARTS), ranked by relevance rather than dumping every
+    applicable spec. Each chart carries a default chart_type plus the other
+    types a UI could offer instead."""
     schema = read_schema_markdown(dataset["schema_path"])
     names = {c["name"] for c in schema["columns"]}
     where_sql, label = detect_scope(question, schema)
     where = where_sql or "1=1"
-    charts = []
+
+    candidates = []
     for title, group, measure in CHART_SPECS:
         if group not in names or (measure and measure not in names):
             continue
+        score = _chart_relevance_score(title, group, measure, question, names)
+        candidates.append((score, title, group, measure))
+
+    # Highest relevance first; keep the original CHART_SPECS order as a
+    # tiebreaker so results are stable across runs.
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    charts = []
+    for score, title, group, measure in candidates:
+        if len(charts) >= max_charts:
+            break
         g = quote_identifier(group)
         value = f"SUM({quote_identifier(measure)})" if measure else "COUNT(*)"
         order = g if group == "order_month" else "2 DESC"
@@ -871,8 +983,17 @@ def build_charts(question, dataset):
             dataset["db_path"],
         )
         if len(df) > 1:
-            charts.append({"title": f"{title} ({label})", "data": df})
+            suggested = suggest_chart_types(group)
+            charts.append({
+                "title": f"{title} ({label})",
+                "data": df,
+                "chart_type": suggested[0],
+                "available_types": suggested,
+                "relevance_score": score,
+            })
     return charts, label
+
+
 # =========================================================
 # MULTI-QUERY ANALYSIS
 # =========================================================
@@ -1180,10 +1301,11 @@ column must be represented in the SQL. Every explicit filter must be preserved.
 
         if not valid:
             problems.append("no structurally valid focused query was produced")
-        else:
+        elif not problems:
             # Generic semantic gate: this catches SQL that is valid SQLite but answers
             # a different analytical question. It does not know anything about specific
-            # columns or example questions.
+            # columns or example questions. Skipped when structural checks already
+            # found problems, since that plan is being regenerated anyway.
             semantically_valid, semantic_issues = verify_analysis_plan(
                 question, schema_json, intent, valid,
                 history=(history if question_needs_history(question, history) else [])
@@ -1318,7 +1440,7 @@ def narrate_multi_query_analysis(question, executed, history=None):
             stream=False,
             options={"temperature": 0},
         )
-        answer = response.message.content.strip()
+        answer = clean_narration_text(response.message.content.strip())
         if answer:
             return answer
     except Exception:
@@ -1340,37 +1462,43 @@ def narrate_multi_query_analysis(question, executed, history=None):
 
 
 def multi_query_analysis(question, dataset, max_queries=4, history=None):
-    """Analyze exactly what the user asked for. Qwen generates the analysis SQL;
-    Python only grounds the prompt, verifies the schema, executes safely, and
-    sends the actual results back for narration. If the planner cannot produce
-    a single structurally + semantically valid query after its retries, this
-    falls back to analyze_dataset's whole-dataset summary rather than a dead
-    end, since a local 8B model will sometimes fail these checks even for a
-    reasonable question."""
-    schema_json = get_database_schema(dataset["schema_path"])
-    if re.search(r"\b(19\d{2}|20\d{2})\b", question):
-        return analyze_scope(question, dataset)
+    """Analyze exactly what the user asked for, and ALWAYS attach a small set
+    of the most relevant charts alongside the narrated text answer.
 
-    # The analysis planner is the single source of truth for the user's intent.
-    # It generates metric, dimensions, filters, time logic, and focused SQL together.
-    # We deliberately do not run a separate filter-generation stage here: that stage
-    # could reject a valid question before the SQL planner gets a chance to answer it.
+    Returns a dict: {"text": <narration str>, "charts": <list of chart dicts>}
+
+    Scope (a year mentioned in the question) is detected once and passed into
+    the LLM planner as a verified WHERE clause, so the planner can combine
+    scope + the user's actual metric/grouping intent in one pass, instead of
+    a year short-circuiting straight to a generic whole-dataset-style scoped
+    breakdown that ignores what was actually asked. analyze_scope() is now
+    only a fallback for when the planner fails outright.
+    """
+    schema_json = get_database_schema(dataset["schema_path"])
+    schema_dict = json.loads(schema_json)
+    where_clause, scope_label = detect_scope(question, schema_dict)
+
     relevant_history = history if question_needs_history(question, history) else []
     queries = generate_analysis_queries(
         question, schema_json, max_queries=max_queries, history=relevant_history,
-        where_clause=None, db_path=dataset["db_path"]
+        where_clause=where_clause, db_path=dataset["db_path"]
     )
 
     if not queries:
-        return analyze_dataset(question, dataset)
+        # Planner failed structurally/semantically after all retries.
+        # Fall back to a scoped generic summary if a year was detected,
+        # otherwise a whole-dataset summary.
+        narration = analyze_scope(question, dataset) if where_clause else analyze_dataset(question, dataset)
+        charts, _ = build_charts(question, dataset)
+        return {"text": narration, "charts": charts}
 
     executed = run_analysis_queries(queries, dataset["db_path"])
 
-    # Do not infer a separate scope here. The executed SQL itself contains the
-    # validated filters requested by the user; narrate_multi_query_analysis
-    # reads that SQL directly rather than trusting a separately-derived field.
-    return narrate_multi_query_analysis(question, executed, history=relevant_history)
-
+    # Each executed query's own SQL is the authoritative record of scope and
+    # intent; narrate_multi_query_analysis reads that directly.
+    narration = narrate_multi_query_analysis(question, executed, history=relevant_history)
+    charts, _ = build_charts(question, dataset)  # default visualization, always included
+    return {"text": narration, "charts": charts}
 
 # =========================================================
 # CLEAN MODEL OUTPUT
@@ -1500,6 +1628,27 @@ def execute_sql(sql, db_path=None):
 # MAIN APPLICATION
 # =========================================================
 
+def print_charts_summary(charts):
+    """CLI-friendly rendering of the chart metadata attached to an analysis.
+    A GUI caller (e.g. Streamlit) would instead use chart['data'] directly
+    with chart['chart_type'] / chart['available_types'] to draw real bar,
+    pie, or line charts and let the user switch between available_types."""
+    if not charts:
+        return
+    print()
+    print(f"DEFAULT VISUALIZATIONS ({len(charts)} most relevant)")
+    print("-" * 60)
+    for chart in charts:
+        types = "/".join(chart["available_types"])
+        print(f"- {chart['title']}  [default: {chart['chart_type']}, options: {types}]")
+        preview = chart["data"].head(5).to_string(index=False)
+        print(preview)
+        if len(chart["data"]) > 5:
+            print(f"  ... ({len(chart['data'])} rows total)")
+        print()
+    print("-" * 60)
+
+
 def main():
 
     print("=" * 60)
@@ -1544,7 +1693,12 @@ def main():
 
                 print("Planning and running multiple SQL queries to analyze this...")
 
-                answer_text = multi_query_analysis(standalone, dataset)
+                # multi_query_analysis now always returns both the narrated
+                # text AND a default set of the most relevant charts, so no
+                # separate "did they ask for a chart" check is needed here.
+                result = multi_query_analysis(standalone, dataset)
+                answer_text = result["text"]
+                charts = result["charts"]
                 sql = None
 
                 print()
@@ -1552,6 +1706,8 @@ def main():
                 print("-" * 60)
                 print(answer_text)
                 print("-" * 60)
+
+                print_charts_summary(charts)
 
             else:
 
@@ -1576,8 +1732,8 @@ def main():
                 print()
                 print("Executing query...")
 
-                result = execute_sql(sql, db_path=dataset["db_path"])
-                answer_text = generate_answer(standalone, sql, result)
+                result_df = execute_sql(sql, db_path=dataset["db_path"])
+                answer_text = generate_answer(standalone, sql, result_df)
 
                 print()
                 print("ANSWER")
