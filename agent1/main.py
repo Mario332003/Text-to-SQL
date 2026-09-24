@@ -1354,9 +1354,6 @@ def run_analysis_queries(queries, db_path, row_cap=100):
         entry["columns"] = list(result.columns)
         entry["total_rows"] = len(result)
         entry["included_rows"] = len(preview)
-        if len(result) > len(preview):
-            entry["warning"] = (f"Only the first {len(preview)} of {len(result)} rows are shown. "
-                                "Do not name highest, lowest, or top values from this query.")
         entry["rows"] = json.loads(preview.to_json(orient="records", date_format="iso"))
         executed.append(entry)
     return executed

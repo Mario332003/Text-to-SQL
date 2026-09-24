@@ -4,7 +4,7 @@ import re
 
 import streamlit as st
 
-from main import (
+from agent1.main import (
     create_database,
     generate_sql,
     validate_sql,
