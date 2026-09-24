@@ -1,7 +1,5 @@
-import pandas as pd
+from main import classify_question, is_analysis_request
 
-df = pd.read_csv("data/ecommerce_cleaned.csv")
-print(df.shape)
-for col in df.columns:
-    if df[col].nunique() <= 20:
-        print(col, df[col].value_counts().to_dict())
+q = "i want a full analysis for the last 3 months in 2025"
+print("keyword match:", is_analysis_request(q))
+print("classify_question:", classify_question(q))

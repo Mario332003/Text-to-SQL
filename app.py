@@ -6,15 +6,7 @@ import streamlit as st
 
 from main import (
     create_database,
-    generate_sql,
-    validate_sql,
-    execute_sql,
-    generate_answer,
-    classify_question,
-    multi_query_analysis,
-    resolve_follow_up,
-    wants_charts,
-    build_charts,
+    orchestrate_question,
     CSV_PATH,
 )
 
@@ -195,11 +187,14 @@ def display_message(message, msg_index=0):
                 if "result" in message:
                     st.dataframe(message["result"], use_container_width=True)
 
+        # Which orchestrator route handled this answer, for debugging.
+        if message.get("routed_to"):
+            st.caption(f"Routed to: `{message['routed_to']}`")
+
         # Raw error is shown for every path, not only when SQL exists
         if message.get("raw_error"):
             with st.expander("Error details"):
                 st.code(message["raw_error"])
-
 
 # ============================================================
 # DISPLAY PREVIOUS CONVERSATION
@@ -213,51 +208,20 @@ for i, message in enumerate(st.session_state.messages):
 # ANSWER ONE QUESTION
 # ============================================================
 
-def answer_question(standalone):
-    """Route a standalone question and return the assistant message dict."""
+def answer_question(question, history):
+    """Route a raw question through the orchestrator and return the
+    assistant message dict, with routing shown for debugging."""
     message = {"role": "assistant"}
 
     try:
-        # 1. Explicit chart-only requests ("show me a chart of...") with no
-        # narration wanted: Python draws them directly, no LLM narration call.
-        if wants_charts(standalone):
-            with st.spinner("Building charts..."):
-                charts, label = build_charts(standalone, dataset)
-            message["charts"] = charts
-            message["content"] = (
-                f"Here is a visual summary of {label}."
-                if charts else
-                "I couldn't build charts for that scope. Check that it matches data in the file."
-            )
-
-        # 2. Broad analysis: several queries, or the year-scoped analysis.
-        # multi_query_analysis now always returns both the narrated text AND
-        # a default set of the most relevant charts in one call, so no
-        # separate build_charts() call is needed on this path.
-        elif classify_question(standalone):
-            with st.spinner("Planning and running multiple SQL queries..."):
-                result = multi_query_analysis(standalone, dataset)
-            message["content"] = result["text"]
-            message["charts"] = result["charts"]
-
-        # 3. Specific lookup: one SQL query
-        else:
-            with st.spinner("Checking the data with Qwen..."):
-                sql = generate_sql(
-                    standalone,
-                    schema_path=dataset["schema_path"],
-                    db_path=dataset["db_path"],
-                )
-                message["sql"] = sql
-
-                if not validate_sql(sql):
-                    raise ValueError(
-                        "The generated SQL was rejected by the safety validator."
-                    )
-
-                result_df = execute_sql(sql, db_path=dataset["db_path"])
-                message["result"] = result_df
-                message["content"] = generate_answer(standalone, sql, result_df)
+        result = orchestrate_question(question, dataset, history=history)
+        message["content"] = result["text"]
+        message["charts"] = result.get("charts", [])
+        message["routed_to"] = result["routed_to"]
+        if result.get("sql"):
+            message["sql"] = result["sql"]
+        if result.get("result") is not None:
+            message["result"] = result["result"]
 
     except Exception as error:
         message.update(
@@ -284,19 +248,12 @@ if prompt := st.chat_input("Ask a question about this dataset"):
         # History BEFORE adding the new message
         history = list(st.session_state.messages)
 
-        # Self-contained questions come back unchanged; follow-ups such as
-        # "Now only Premium" become full standalone questions.
-        with st.spinner("Understanding your question..."):
-            standalone = resolve_follow_up(question, history)
-
         user_message = {"role": "user", "content": question}
-        if standalone != question:
-            user_message["content"] = f"{question} (interpreted as: {standalone})"
-
         st.session_state.messages.append(user_message)
         display_message(user_message, msg_index=len(st.session_state.messages) - 1)
 
-        assistant_message = answer_question(standalone)
-
+        with st.spinner("Thinking..."):
+            assistant_message = answer_question(question, history)
+            
         st.session_state.messages.append(assistant_message)
         display_message(assistant_message, msg_index=len(st.session_state.messages) - 1)
