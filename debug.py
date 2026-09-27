@@ -1,5 +1,5 @@
 import json
-from main import (CSV_PATH, create_database, get_database_schema,
+from agent1.main import (CSV_PATH, create_database, get_database_schema,
                   generate_analysis_queries, execute_sql)
 
 print("CSV in use:", CSV_PATH)
