@@ -223,3 +223,15 @@ data/*
 !data/cleaned/
 data/cleaned/*
 !data/cleaned/ecommerce_cleaned.csv
+
+# macOS
+.DS_Store
+
+# Generated datasets and local runtime artifacts
+agent1/data/
+agent2/data/generated/
+*.db
+agent4/debug/
+agent4/outputs/
+attachments/
+image_uploads/

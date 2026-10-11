@@ -34,6 +34,11 @@ PLACE_FORMAT = {
     "additionalProperties": False,
 }
 
+MULTI_PLACE_PATTERN = re.compile(
+    r"(?is)\b(?:cities|places|locations)\s*:\s*(.+?)(?:\.\s|$)"
+)
+
+
 def create_database():
     """agent3 has no local dataset - exists only so orchestrator.
     get_agent_dataset() can call every agent uniformly."""
@@ -43,6 +48,24 @@ def create_database():
 def get_database_schema(schema_path=None):
     """Mirrors agent1/agent2's signature for build_routing_catalog()."""
     return json.dumps({"columns": [{"name": c} for c in CAPABILITIES]})
+
+
+def extract_explicit_places(question: str) -> list[str]:
+    match = MULTI_PLACE_PATTERN.search(question)
+    if not match:
+        return []
+    raw_places = re.split(r"\s*;\s*", match.group(1).strip())
+    places = []
+    seen = set()
+    for place in raw_places:
+        clean = re.sub(r"\s+", " ", place).strip(" .")
+        if not clean:
+            continue
+        key = clean.casefold()
+        if key not in seen:
+            seen.add(key)
+            places.append(clean)
+    return places
 
 
 def extract_place(question: str):
@@ -90,6 +113,65 @@ def extract_place(question: str):
             return None
     return None
 
+
+def format_current_temperature(place: dict, data: dict) -> str:
+    current = data.get("current") or {}
+    current_units = data.get("current_units") or {}
+    temp = current.get("temperature_2m")
+    unit = current_units.get("temperature_2m", "°C")
+    if temp is None:
+        temperature = "temperature unavailable"
+    else:
+        temperature = f"{temp}{unit}"
+
+    country = place.get("country")
+    resolved = place.get("name") or "Unknown location"
+    if country:
+        resolved = f"{resolved}, {country}"
+    return f"{resolved}: {temperature}"
+
+
+def handle_multiple_places(question: str, place_names: list[str]):
+    lines = []
+    failures = []
+    temperatures = []
+
+    for place_name in place_names:
+        try:
+            place = _client.geocode(place_name)
+        except ApiClientError as error:
+            failures.append(f"{place_name}: weather service error ({error})")
+            continue
+
+        if place is None:
+            failures.append(f"{place_name}: location not found")
+            continue
+
+        try:
+            data = _client.forecast(place["latitude"], place["longitude"])
+        except ApiClientError as error:
+            failures.append(f"{place_name}: weather service error ({error})")
+            continue
+
+        lines.append(format_current_temperature(place, data))
+        temp = (data.get("current") or {}).get("temperature_2m")
+        if isinstance(temp, (int, float)):
+            temperatures.append((place.get("name") or place_name, temp))
+
+    answer_parts = []
+    if lines:
+        answer_parts.append("Current temperatures: " + "; ".join(lines) + ".")
+    if failures:
+        answer_parts.append("Missing weather lookups: " + "; ".join(failures) + ".")
+    if "hottest" in question.lower() and len(temperatures) == len(place_names) and temperatures:
+        hottest_name, hottest_temp = max(temperatures, key=lambda item: item[1])
+        answer_parts.append(f"The hottest among them is {hottest_name} at {hottest_temp}°C.")
+
+    if not answer_parts:
+        return "I couldn't get weather for the requested cities.", [], None
+    return " ".join(answer_parts), [], None
+
+
 def format_response(question: str, place: dict, data: dict) -> str:
     """Turn the raw Open-Meteo payload into a plain-English answer, same
     pattern as agent2.generate_answer()."""
@@ -132,6 +214,10 @@ def format_response(question: str, place: dict, data: dict) -> str:
 def handle(question: str):
     """Returns (answer_text, charts, sql_or_None) - same shape orchestrator.
     answer_question() expects from every agent."""
+    explicit_places = extract_explicit_places(question)
+    if explicit_places:
+        return handle_multiple_places(question, explicit_places)
+
     place_name = extract_place(question)
     print(f"DEBUG extract_place returned: {place_name!r}")
     if place_name is None:

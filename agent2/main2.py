@@ -434,9 +434,10 @@ def generate_sql(question, history=None, schema_path=None, db_path=None):
     system_prompt = """
 You convert questions into one read-only SQLite SELECT query (WITH is allowed).
 Use only the table and exact column names in the supplied schema - never invent,
-abbreviate, or guess a column name (e.g. do not invent "order_year" or
-"order_month"; if you need a year or month, derive it from an existing date
-column with strftime('%Y', "date_col") / strftime('%m', "date_col")). Where the
+abbreviate, or guess a column name. If the schema already has explicit date-part
+columns such as "order_year", "order_month", "year", or "month", use those exact
+columns for year/month filters instead of deriving from a date text column. Only
+use strftime/substr on a date column when no suitable year/month columns exist. Where the
 REAL DATA VALUES list sample values for a column, match one of those values
 exactly (including case and punctuation) when filtering on it, rather than
 guessing a plausible-looking value that may not exist in the data. Quote
