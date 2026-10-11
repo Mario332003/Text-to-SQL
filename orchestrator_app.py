@@ -29,7 +29,9 @@ st.write(
 st.sidebar.subheader("Registered agents")
 for _agent in AGENTS:
     st.sidebar.markdown(f"**{_agent['name']}**")
-    st.sidebar.caption(_agent["core"].CSV_PATH)
+    source_path = getattr(_agent["core"], "CSV_PATH", None) or getattr(_agent["core"], "DATA_DIR", None)
+    if source_path:
+        st.sidebar.caption(str(source_path))
 
 reload_clicked = st.sidebar.button("Reload all datasets")
 
@@ -44,16 +46,39 @@ def get_all_datasets(agent_mtimes):
     so Streamlit's cache key changes whenever ANY underlying CSV changes on
     disk - the actual value isn't used below, get_agent_dataset() re-derives
     everything from each agent's own CSV_PATH."""
-    return {agent["id"]: get_agent_dataset(agent) for agent in AGENTS}
+    datasets = {}
+    for agent in AGENTS:
+        try:
+            datasets[agent["id"]] = get_agent_dataset(agent)
+        except Exception as error:
+            datasets[agent["id"]] = {
+                "fingerprint": f"unavailable:{error}",
+                "schema_path": None,
+                "db_path": None,
+                "error": str(error),
+            }
+    return datasets
 
 
 def _current_mtimes():
     mtimes = []
     for agent in AGENTS:
         try:
-            mtimes.append((agent["id"], os.path.getmtime(agent["core"].CSV_PATH)))
+            csv_path = getattr(agent["core"], "CSV_PATH", None)
+            data_dir = getattr(agent["core"], "DATA_DIR", None)
+            if csv_path:
+                mtimes.append(
+                    (agent["id"], os.path.getmtime(csv_path) if os.path.exists(csv_path) else "missing")
+                )
+            elif data_dir:
+                pdf_mtimes = tuple(
+                    sorted((path.name, os.path.getmtime(path)) for path in data_dir.glob("*.pdf"))
+                )
+                mtimes.append((agent["id"], pdf_mtimes))
+            else:
+                mtimes.append((agent["id"], "static"))
         except OSError as error:
-            st.error(f"Could not find the CSV file for {agent['name']}: {error}")
+            st.error(f"Could not find the data files for {agent['name']}: {error}")
             st.stop()
     return tuple(mtimes)
 
@@ -70,7 +95,7 @@ except Exception as error:
 
 
 # Clear conversation automatically if any agent's dataset changes
-fingerprint = tuple(sorted((aid, d["fingerprint"]) for aid, d in datasets.items()))
+fingerprint = tuple(sorted((aid, d.get("fingerprint", "static")) for aid, d in datasets.items()))
 if st.session_state.get("dataset_fingerprint") != fingerprint:
     st.session_state.messages = []
     st.session_state.dataset_fingerprint = fingerprint
@@ -82,6 +107,8 @@ if st.session_state.get("dataset_fingerprint") != fingerprint:
 
 for agent in AGENTS:
     dataset = datasets[agent["id"]]
+    if not dataset.get("schema_path"):
+        continue
     with open(dataset["schema_path"], encoding="utf-8") as schema_file:
         st.sidebar.download_button(
             f"Download {agent['id']} schema.md",
@@ -219,18 +246,32 @@ for i, message in enumerate(st.session_state.messages):
 
 def answer_question(standalone, history):
     with st.spinner("Routing to the right agent..."):
-        agent_id, reasoning = route_question(standalone, AGENTS, history)
+        agent_ids, reasoning = route_question(standalone, AGENTS, history)
 
-    agent = AGENTS_BY_ID[agent_id]
+    agent = AGENTS_BY_ID[agent_ids[0]]
     core = agent["core"]
-    dataset = datasets[agent_id]
+    dataset = datasets[agent["id"]]
 
     message = {"role": "assistant", "agent_name": agent["name"], "routing_reason": reasoning}
 
     try:
-        # 1. Explicit chart-only requests ("show me a chart of...") with no
+        if dataset.get("error"):
+            raise RuntimeError(
+                f"{agent['name']} could not initialize its data files: {dataset['error']}"
+            )
+
+        # 1. Non-SQL/API/RAG agents can answer directly.
+        if agent.get("kind") in {"api", "rag"}:
+            with st.spinner(f"Checking {agent['name']}..."):
+                answer_text, charts, sql = core.handle(standalone, dataset) if agent.get("kind") == "rag" else core.handle(standalone)
+            message["content"] = answer_text
+            message["charts"] = charts
+            if sql:
+                message["sql"] = sql
+
+        # 2. Explicit chart-only requests ("show me a chart of...") with no
         # narration wanted: Python draws them directly, no LLM narration call.
-        if core.wants_charts(standalone):
+        elif core.wants_charts(standalone):
             with st.spinner(f"Building charts from {agent['name']}..."):
                 charts, label = core.build_charts(standalone, dataset)
             message["charts"] = charts
@@ -240,14 +281,14 @@ def answer_question(standalone, history):
                 "I couldn't build charts for that scope. Check that it matches data in the file."
             )
 
-        # 2. Broad analysis: several queries, planned and narrated together.
+        # 3. Broad analysis: several queries, planned and narrated together.
         elif core.classify_question(standalone):
             with st.spinner(f"Planning and running multiple SQL queries on {agent['name']}..."):
                 result = core.multi_query_analysis(standalone, dataset)
             message["content"] = result["text"]
             message["charts"] = result["charts"]
 
-        # 3. Specific lookup: one SQL query
+        # 4. Specific lookup: one SQL query
         else:
             with st.spinner(f"Checking {agent['name']}'s data..."):
                 sql = core.generate_sql(

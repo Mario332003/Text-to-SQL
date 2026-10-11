@@ -12,6 +12,7 @@ import agent1.main as agent1_core    # noqa: E402  (ecommerce agent)
 import agent2.main2 as agent2_core   # noqa: E402  (FIFA agent)
 import agent3.agent3 as agent3_core  # noqa: E402  (weather agent)
 import agent4.agent4 as agent4_core  # noqa: E402  (architectural vision agent)
+import agent5.agent5 as agent5_core  # noqa: E402  (EFA regulations RAG agent)
 
 ROUTER_MODEL_NAME = agent1_core.MODEL_NAME
 
@@ -61,11 +62,35 @@ AGENTS = [
         "core": agent4_core,
         "kind": "vision",
     },
+    {
+        "id": "efa_regulations",
+        "name": "Egyptian Football Association regulations agent",
+        "description": (
+            "Arabic RAG search over Egyptian Football Association PDF regulations: "
+            "competition rules, statutes, disciplinary penalties, league regulations, "
+            "clubs, players, matches, sanctions, appeals, and governance rules. "
+            "Use this for Arabic questions about EFA laws and regulations."
+        ),
+        "core": agent5_core,
+        "kind": "rag",
+    },
 ]
 
 AGENTS_BY_ID = {a["id"]: a for a in AGENTS}
 
 _DATASET_CACHE = {}
+
+
+def _looks_like_efa_regulations_question(question):
+    text = question.casefold()
+    arabic_signal = re.search(r"[\u0600-\u06FF]", text)
+    regulation_terms = (
+        "الاتحاد المصري", "الاتحاد المصرى", "لائحة", "لايحة", "قانون",
+        "قوانين", "عقوبة", "عقوبات", "انسحاب", "مباراة", "مسابقة",
+        "الدوري", "الدورى", "نادي", "النادي", "لاعب", "ايقاف", "إيقاف",
+        "غرامة", "استئناف", "انضباط",
+    )
+    return bool(arabic_signal and any(term in text for term in regulation_terms))
 
 
 def get_agent_dataset(agent):
@@ -79,13 +104,20 @@ def get_agent_dataset(agent):
 def build_routing_catalog(agents):
     catalog = []
     for agent in agents:
-        dataset = get_agent_dataset(agent)
-        schema = json.loads(agent["core"].get_database_schema(dataset["schema_path"]))
+        try:
+            if agent.get("kind") in {"api", "vision", "rag"}:
+                schema = json.loads(agent["core"].get_database_schema(None))
+            else:
+                dataset = get_agent_dataset(agent)
+                schema = json.loads(agent["core"].get_database_schema(dataset["schema_path"]))
+            columns = [c["name"] for c in schema.get("columns", [])]
+        except Exception:
+            columns = []
         catalog.append({
             "id": agent["id"],
             "name": agent["name"],
             "description": agent["description"],
-            "columns": [c["name"] for c in schema["columns"]],
+            "columns": columns,
         })
     return catalog
 
@@ -111,6 +143,10 @@ def route_question(question, agents=None, history=None):
     the top e-commerce country") can route to multiple agents at once; their
     individual answers are later merged by synthesize_multi_agent_answer()."""
     agents = agents or AGENTS
+    if _looks_like_efa_regulations_question(question):
+        if any(agent["id"] == "efa_regulations" for agent in agents):
+            return ["efa_regulations"], "Arabic football regulations question matched Agent 5"
+
     if len(agents) == 1:
         return [agents[0]["id"]], "only one agent registered"
 
@@ -448,6 +484,10 @@ def answer_question(question, agent, dataset):
 
     if agent.get("kind") == "api":
         answer_text, charts, sql = core.handle(question)
+        return answer_text, charts, sql, []
+
+    if agent.get("kind") == "rag":
+        answer_text, charts, sql = core.handle(question, dataset)
         return answer_text, charts, sql, []
 
     if core.classify_question(question):
